@@ -1,0 +1,750 @@
+<?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\Test;
+
+use Psy\Configuration;
+use Psy\Exception\BreakException;
+use Psy\ExecutionClosure;
+use Psy\ExecutionLoop\AbstractListener;
+use Psy\ExecutionLoop\ExecutionCleanupListener;
+use Psy\ExecutionLoop\Listener;
+use Psy\ExecutionLoopClosure;
+use Psy\Readline\Transient;
+use Psy\Shell;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\BufferedOutput;
+
+class ExecutionClosureTest extends TestCase
+{
+    protected function tearDown(): void
+    {
+        if (\function_exists('readline_clear_history')) {
+            \readline_clear_history();
+        }
+
+        parent::tearDown();
+    }
+
+    public function testAfterExecuteRunsAfterSuccessfulExecutionIsSettled()
+    {
+        [$shell, $listener] = $this->getShell();
+
+        $this->assertSame(42, $shell->execute('echo "hello"; $answer = 42; $answer', true));
+        $this->assertSame(1, $listener->afterExecuteCalls);
+        $this->assertSame(0, $listener->afterLoopCalls);
+        $this->assertSame(42, $listener->scopeVariables['answer']);
+        $this->assertSame('hello', $listener->scopeVariables['__out']);
+        $this->assertSame([false, false], $listener->runActiveStates);
+    }
+
+    public function testAfterExecuteRunsAfterFailedExecutionIsCleanedUp()
+    {
+        [$shell, $listener] = $this->getShell();
+        $outputBufferLevel = \ob_get_level();
+
+        try {
+            $shell->execute('throw new \RuntimeException("failed")', true);
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('failed', $e->getMessage());
+        }
+
+        $this->assertSame(1, $listener->afterExecuteCalls);
+        $this->assertSame(0, $listener->afterLoopCalls);
+        $this->assertSame($outputBufferLevel, $listener->outputBufferLevel);
+        $this->assertSame([false, false], $listener->runActiveStates);
+    }
+
+    public function testNestedDirectExecutionPairsExecutionCallbacks()
+    {
+        [$shell, $listener] = $this->getShell();
+        $shell->setScopeVariables(['shell' => $shell]);
+
+        $this->assertSame([1, 2], $shell->execute('return [1, $shell->execute("return 2;", true)];', true));
+        $this->assertSame(2, $listener->onExecuteCalls);
+        $this->assertSame(2, $listener->afterExecuteCalls);
+        $this->assertSame(0, $listener->afterLoopCalls);
+    }
+
+    /**
+     * Run with piped stdin so simulated terminal state cannot affect the test runner's TTY.
+     *
+     * @runInSeparateProcess
+     *
+     * @preserveGlobalState disabled
+     */
+    public function testNestedExecutionKeepsFallbackSignalCharsUntilOuterCleanup()
+    {
+        [$shell, $listener] = $this->getShell();
+        $shell->setScopeVariables(['shell' => $shell]);
+        $listener->captureInteractiveSignalChars = true;
+
+        $this->assertSame([1, 2], $shell->execute('return [1, $shell->execute("return 2;", true)];', true));
+        $this->assertSame([true, false], $listener->interactiveSignalCharsStates);
+    }
+
+    public function testAfterExecuteOnlyRunsForListenersWhoseOnExecuteCompleted()
+    {
+        $completed = new ExecutionClosureListener();
+        $throwing = new ThrowingExecutionClosureListener();
+        $skipped = new ExecutionClosureListener();
+        $shell = $this->createShell([$completed, $throwing, $skipped]);
+
+        try {
+            $shell->execute('42', true);
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('failed', $e->getMessage());
+        }
+
+        $this->assertSame(1, $completed->onExecuteCalls);
+        $this->assertSame(1, $completed->afterExecuteCalls);
+        $this->assertSame(1, $throwing->onExecuteCalls);
+        $this->assertSame(0, $throwing->afterExecuteCalls);
+        $this->assertSame(0, $skipped->onExecuteCalls);
+        $this->assertSame(0, $skipped->afterExecuteCalls);
+    }
+
+    public function testNestedSetupFailureDoesNotCleanUpOuterExecution()
+    {
+        [$shell, $listener] = $this->getShell();
+        $shell->setScopeVariables(['shell' => $shell, 'listener' => $listener]);
+
+        $code = <<<'PHP'
+$shell->failFlushCode = true;
+try {
+    $shell->execute('42', true);
+} catch (\RuntimeException $e) {
+}
+return $listener->afterExecuteCalls;
+PHP;
+        $result = $shell->execute($code, true);
+
+        $this->assertSame(0, $result);
+        $this->assertSame(1, $listener->onExecuteCalls);
+        $this->assertSame(1, $listener->afterExecuteCalls);
+    }
+
+    public function testAfterExecuteHookIsOptionalForLoopListeners()
+    {
+        $listener = new LegacyExecutionClosureListener();
+        $shell = $this->createShell([$listener]);
+
+        $this->assertSame(42, $shell->execute('21 * 2', true));
+        $this->assertSame(1, $listener->onExecuteCalls);
+    }
+
+    public function testLegacyOnExecuteDoesNotRequireAnExecutionFrame()
+    {
+        [$shell, $listener] = $this->getShell();
+
+        $this->assertSame(42, eval($shell->onExecute('return 42;')));
+        $shell->afterLoop();
+        $shell->afterExecute();
+
+        $this->assertSame(1, $listener->onExecuteCalls);
+        $this->assertSame(1, $listener->afterLoopCalls);
+        $this->assertSame(0, $listener->afterExecuteCalls);
+    }
+
+    /**
+     * @dataProvider boundaryFailures
+     */
+    public function testResourceCleanupAttemptsEveryListenerAndPreservesFirstFailure(bool $setupFails, bool $bodyFails)
+    {
+        $completed = new ExecutionResourceTestListener();
+        $first = new ExecutionResourceTestListener();
+        $last = new ExecutionResourceTestListener();
+        $skipped = new ExecutionResourceTestListener();
+        $shell = $this->createShell([$completed, $last, $first, $skipped]);
+        $setupFailure = new \RuntimeException('setup');
+        $bodyFailure = new \RuntimeException('body');
+        $cleanupFailure = new \LogicException('first cleanup');
+        $first->setupFailure = $setupFails ? $setupFailure : null;
+        $first->cleanupFailure = $cleanupFailure;
+        $last->cleanupFailure = new \LogicException('last cleanup');
+        $closure = new class($shell, $bodyFails ? $bodyFailure : null) extends ExecutionClosure {
+            public function __construct(Shell $shell, ?\Throwable $failure)
+            {
+                // Downstream constructors need not call the parent constructor.
+                $this->setClosure($shell, static function () use ($shell, $failure) {
+                    $result = eval($shell->onExecute('return 42;'));
+                    if ($failure !== null) {
+                        throw $failure;
+                    }
+
+                    return $result;
+                });
+            }
+        };
+
+        try {
+            $closure->execute();
+            $this->fail('Expected setup, execution or cleanup failure');
+        } catch (\RuntimeException|\LogicException $e) {
+            $this->assertSame($setupFails ? $setupFailure : ($bodyFails ? $bodyFailure : $cleanupFailure), $e);
+        }
+
+        $this->assertSame(1, $completed->cleanupCalls);
+        $this->assertSame(1, $last->cleanupCalls);
+        $this->assertSame($setupFails ? 0 : 1, $first->cleanupCalls);
+        $this->assertSame($setupFails ? 0 : 1, $skipped->setupCalls);
+        $this->assertSame($setupFails ? 0 : 1, $skipped->cleanupCalls);
+
+        // Cleanup failures must release ownership for the next execution.
+        $first->setupFailure = $first->cleanupFailure = $last->cleanupFailure = null;
+        $this->assertSame(43, $shell->execute('43', true));
+        $this->assertSame(2, $completed->cleanupCalls);
+        $this->assertSame(2, $last->cleanupCalls);
+    }
+
+    public function boundaryFailures(): array
+    {
+        return [[false, false], [false, true], [true, false]];
+    }
+
+    public function testResourceRemainsClaimedDuringReentrantCleanup()
+    {
+        $listener = new ExecutionResourceTestListener();
+        $shell = $this->createShell([$listener]);
+        $listener->onCleanup = function () use ($listener, $shell): void {
+            if ($listener->cleanupCalls === 1) {
+                $this->assertSame(42, $shell->execute('42', true));
+            }
+        };
+
+        $this->assertSame(41, $shell->execute('41', true));
+        $this->assertSame(2, $listener->setupCalls);
+        $this->assertSame(1, $listener->cleanupCalls);
+        $this->assertSame(43, $shell->execute('43', true));
+        $this->assertSame(2, $listener->cleanupCalls);
+    }
+
+    public function testBoundaryUnwindsUnfinishedLoopAndManagedEvaluation()
+    {
+        [$shell, $listener] = $this->getShell();
+        $level = \ob_get_level();
+        $handler = static function (): void {
+        };
+        \set_error_handler($handler);
+        $failure = new \RuntimeException('unfinished evaluation');
+        $closure = new class($shell, $failure) extends ExecutionClosure {
+            public function __construct(Shell $shell, \Throwable $failure)
+            {
+                $this->setClosure($shell, function () use ($shell, $failure): void {
+                    $shell->beforeLoop();
+                    $shell->beforeExecute();
+                    $shell->onExecute('return 42;');
+
+                    throw $failure;
+                });
+            }
+        };
+
+        try {
+            try {
+                $closure->execute();
+                $this->fail('Expected unfinished evaluation failure');
+            } catch (\RuntimeException $e) {
+                $this->assertSame($failure, $e);
+            }
+
+            $this->assertSame($level, \ob_get_level());
+            $currentHandler = \set_error_handler($handler);
+            \restore_error_handler();
+            $this->assertSame($handler, $currentHandler);
+            $this->assertSame(1, $listener->afterExecuteCalls);
+            $this->assertSame(43, $shell->execute('43', true));
+            $this->assertSame(2, $listener->afterExecuteCalls);
+        } finally {
+            \restore_error_handler();
+        }
+    }
+
+    /**
+     * @dataProvider executionCleanupFailures
+     */
+    public function testCleanupAttemptsEveryListenerAndPreservesFirstFailure(bool $loop, bool $evaluationFails, bool $outputFails)
+    {
+        $completed = new ExecutionClosureListener();
+        $firstFailure = new \LogicException('first cleanup failure');
+        $lastFailure = new \LogicException('last cleanup failure');
+        $first = new FailingExecutionCleanupListener($firstFailure);
+        $last = new FailingExecutionCleanupListener($lastFailure);
+        // Cleanup runs in reverse setup order.
+        $shell = $this->createShell([$completed, $last, $first]);
+        $failure = new \RuntimeException('evaluation failure');
+        $outputFailure = new \LogicException('output cleanup failure');
+        $shell->setScopeVariables(['failure' => $failure, 'outputFailure' => $outputFailure]);
+        $code = $outputFails ? 'ob_start(function () use ($outputFailure) { throw $outputFailure; }); ' : '';
+        $code .= $evaluationFails ? 'throw $failure;' : '$answer = 42;';
+        $level = \ob_get_level();
+
+        if ($loop) {
+            $shell->addInput($code, true);
+            $shell->addInput('exit', true);
+            $this->assertSame(0, (new ExecutionLoopClosure($shell))->execute());
+            $caught = $shell->getScopeVariable('_e');
+        } else {
+            try {
+                $shell->execute($code, true);
+                $this->fail('Expected evaluation or cleanup failure');
+            } catch (\RuntimeException|\LogicException $e) {
+                $caught = $e;
+            }
+        }
+
+        $expected = $evaluationFails ? $failure : ($outputFails ? $outputFailure : $firstFailure);
+        $this->assertSame($expected, $caught);
+        $this->assertSame($level, \ob_get_level());
+        $this->assertSame($level, $completed->outputBufferLevel);
+        $this->assertSame(1, $completed->afterExecuteCalls);
+        $this->assertSame(1, $first->afterExecuteCalls);
+        $this->assertSame(1, $last->afterExecuteCalls);
+        if (!$evaluationFails && !$outputFails) {
+            $this->assertSame(42, $completed->scopeVariables['answer']);
+        }
+
+        // A cleanup failure must not leave a frame behind for the next call.
+        $first->failure = $last->failure = null;
+        $this->assertSame(43, $shell->execute('43', true));
+        $this->assertSame(2, $completed->afterExecuteCalls);
+    }
+
+    public function executionCleanupFailures(): array
+    {
+        return [
+            [false, false, false],
+            [false, true, false],
+            [false, false, true],
+            [false, true, true],
+            [true, false, false],
+            [true, true, false],
+            [true, false, true],
+            [true, true, true],
+        ];
+    }
+
+    public function testExecutionLoopPairsExecutionCallbacksWithoutChangingLoopCallbacks()
+    {
+        [$shell, $listener] = $this->getShell();
+        $shell->addInput('42', true);
+        $shell->addInput('exit', true);
+
+        $loop = new ExecutionLoopClosure($shell);
+
+        $this->assertSame(0, $loop->execute());
+        $this->assertSame(1, $listener->onExecuteCalls);
+        $this->assertSame(1, $listener->afterExecuteCalls);
+        $this->assertSame(2, $listener->afterLoopCalls);
+        $this->assertSame(42, $listener->scopeVariables['_']);
+    }
+
+    public function testFullRunOwnsRunStateForItsCompleteLifecycle()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_DISABLED,
+        ]);
+        $shell->addInput('21 * 2', true);
+
+        $this->assertSame(0, $shell->doRun(new ArrayInput([]), new BufferedOutput()));
+        $this->assertSame([true, true, true, true], $listener->runActiveStates);
+        $this->assertFalse($shell->isRunActive());
+    }
+
+    public function testFullRunPairsNestedExecutionCallbacksWithoutLoopCallbacks()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_DISABLED,
+        ]);
+        $shell->addInput('timeit -n3 1 + 1', true);
+
+        $this->assertSame(0, $shell->doRun(new ArrayInput([]), new BufferedOutput()));
+        $this->assertSame(3, $listener->onExecuteCalls);
+        $this->assertSame(3, $listener->afterExecuteCalls);
+        $this->assertSame(0, $listener->afterLoopCalls);
+    }
+
+    public function testNestedFullRunKeepsOuterRunActive()
+    {
+        [$shell] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_DISABLED,
+        ]);
+        $output = new BufferedOutput();
+        $shell->setScopeVariables(['shell' => $shell, 'output' => $output]);
+        $shell->addInput('[$shell->run(null, $output), $shell->isRunActive()]', true);
+
+        $this->assertSame(0, $shell->doRun(new ArrayInput([]), $output));
+        $this->assertSame([0, true], $shell->getScopeVariable('_'));
+        $this->assertFalse($shell->isRunActive());
+    }
+
+    public function testFullRunReleasesRunStateAfterFailure()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_DISABLED,
+        ]);
+        $listener->failBeforeRun = true;
+
+        try {
+            $shell->doRun(new ArrayInput([]), new BufferedOutput());
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('failed', $e->getMessage());
+        }
+
+        $this->assertSame([true], $listener->runActiveStates);
+        $this->assertFalse($shell->isRunActive());
+    }
+
+    public function testInteractiveRunSettlesListenersAfterThrowUp()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_FORCED,
+        ]);
+        $shell->addInput('throw-up new \RuntimeException("failed")', true);
+
+        try {
+            $shell->doRun(new ArrayInput([]), new BufferedOutput());
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('failed', $e->getMessage());
+        }
+
+        $this->assertSame(1, $listener->afterLoopCalls);
+        $this->assertSame(1, $listener->afterRunCalls);
+        $this->assertSame([1], $listener->exitCodes);
+    }
+
+    public function testInteractiveRunRendersListenerFailuresBeforeTeardown()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_FORCED,
+        ]);
+        $listener->failBeforeLoop = true;
+        $output = new BufferedOutput();
+
+        $this->assertSame(1, $shell->run(null, $output));
+        $this->assertSame(1, \substr_count($output->fetch(), 'failed before loop'));
+        $this->assertSame(0, $listener->afterLoopCalls);
+        $this->assertSame(1, $listener->afterRunCalls);
+        $this->assertSame([1], $listener->exitCodes);
+    }
+
+    public function testNonInteractiveRunSettlesListenersAfterIncludeFailure()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_DISABLED,
+        ]);
+        $shell->failIncludes = true;
+        $output = new BufferedOutput();
+
+        $this->assertSame(1, $shell->run(null, $output));
+        $this->assertSame(1, \substr_count($output->fetch(), 'failed include'));
+        $this->assertSame(0, $listener->afterLoopCalls);
+        $this->assertSame(1, $listener->afterRunCalls);
+        $this->assertSame([1], $listener->exitCodes);
+
+        $shell->writeException(new BreakException('finished'));
+        $this->assertStringContainsString('finished', $output->fetch());
+    }
+
+    public function testNonInteractiveRunClearsStateWhenListenerTeardownFails()
+    {
+        [$shell, $listener] = $this->getShell([
+            'interactiveMode' => Configuration::INTERACTIVE_MODE_DISABLED,
+        ]);
+        $listener->failAfterRun = true;
+        $shell->addInput('21 * 2', true);
+        $output = new BufferedOutput();
+
+        try {
+            $shell->doRun(new ArrayInput([]), $output);
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('failed after run', $e->getMessage());
+        }
+
+        $output->fetch();
+        $shell->writeException(new BreakException('finished'));
+        $this->assertStringContainsString('finished', $output->fetch());
+    }
+
+    /**
+     * @return array{ExecutionClosureTestShell, ExecutionClosureListener}
+     */
+    private function getShell(array $options = []): array
+    {
+        $listener = new ExecutionClosureListener();
+
+        return [$this->createShell([$listener], $options), $listener];
+    }
+
+    /**
+     * @param Listener[] $listeners
+     */
+    private function createShell(array $listeners, array $options = []): ExecutionClosureTestShell
+    {
+        $dir = TempPaths::reserve('psysh-test-execution-closure-');
+        $config = new Configuration(\array_merge([
+            'configDir'    => $dir,
+            'dataDir'      => $dir,
+            'runtimeDir'   => $dir,
+            'trustProject' => false,
+        ], $options));
+        $readline = $this->getMockBuilder(Transient::class)
+            ->onlyMethods(['readline'])
+            ->getMock();
+        $readline->method('readline')->willReturn(false);
+        $config->setReadline($readline);
+        $shell = new ExecutionClosureTestShell($config, $listeners);
+        $shell->setOutput(new BufferedOutput());
+
+        return $shell;
+    }
+}
+
+class ExecutionResourceTestListener extends AbstractListener
+{
+    public ?\Throwable $setupFailure = null;
+    public ?\Throwable $cleanupFailure = null;
+    public int $setupCalls = 0;
+    public int $cleanupCalls = 0;
+    public ?\Closure $onCleanup = null;
+
+    public static function isSupported(): bool
+    {
+        return true;
+    }
+
+    public function onExecute(Shell $shell, string $code)
+    {
+        $this->setupCalls++;
+        if ($this->setupFailure !== null) {
+            throw $this->setupFailure;
+        }
+        $shell->claimExecutionResource($this, function (): void {
+            $this->cleanupCalls++;
+            if ($this->onCleanup !== null) {
+                ($this->onCleanup)();
+            }
+            if ($this->cleanupFailure !== null) {
+                throw $this->cleanupFailure;
+            }
+        });
+
+        return null;
+    }
+}
+
+class ExecutionClosureListener extends AbstractListener implements ExecutionCleanupListener
+{
+    public int $afterExecuteCalls = 0;
+    public int $afterLoopCalls = 0;
+    public int $afterRunCalls = 0;
+    public bool $captureInteractiveSignalChars = false;
+    public array $exitCodes = [];
+    public bool $failAfterRun = false;
+    public bool $failBeforeLoop = false;
+    public bool $failBeforeRun = false;
+    public array $interactiveSignalCharsStates = [];
+    public int $onExecuteCalls = 0;
+    public ?int $outputBufferLevel = null;
+    public array $scopeVariables = [];
+    public array $runActiveStates = [];
+
+    public static function isSupported(): bool
+    {
+        return true;
+    }
+
+    public function beforeRun(Shell $shell)
+    {
+        $this->runActiveStates[] = $shell->isRunActive();
+
+        if ($this->failBeforeRun) {
+            throw new \RuntimeException('failed');
+        }
+    }
+
+    public function beforeLoop(Shell $shell)
+    {
+        if ($this->failBeforeLoop) {
+            throw new \RuntimeException('failed before loop');
+        }
+    }
+
+    public function onExecute(Shell $shell, string $code)
+    {
+        $this->onExecuteCalls++;
+        $this->runActiveStates[] = $shell->isRunActive();
+
+        if ($this->captureInteractiveSignalChars && $this->onExecuteCalls === 1) {
+            // Simulate terminal setup owned by the outer evaluation, without
+            // changing the test runner's terminal mode.
+            $enabled = new \ReflectionProperty(Shell::class, 'interactiveSignalCharsEnabled');
+            $scopes = new \ReflectionProperty(Shell::class, 'executionScopes');
+            if (\PHP_VERSION_ID < 80100) {
+                $enabled->setAccessible(true);
+                $scopes->setAccessible(true);
+            }
+            $enabled->setValue($shell, true);
+            $stack = $scopes->getValue($shell);
+            \end($stack)->ownsSignalChars = true;
+        }
+
+        return null;
+    }
+
+    public function afterExecute(Shell $shell)
+    {
+        $this->afterExecuteCalls++;
+        $this->outputBufferLevel = \ob_get_level();
+        $this->scopeVariables = $shell->getScopeVariables();
+        $this->runActiveStates[] = $shell->isRunActive();
+
+        if ($this->captureInteractiveSignalChars) {
+            $interactiveSignalCharsEnabled = new \ReflectionProperty(Shell::class, 'interactiveSignalCharsEnabled');
+            if (\PHP_VERSION_ID < 80100) {
+                $interactiveSignalCharsEnabled->setAccessible(true);
+            }
+            $this->interactiveSignalCharsStates[] = $interactiveSignalCharsEnabled->getValue($shell);
+        }
+    }
+
+    public function afterLoop(Shell $shell)
+    {
+        $this->afterLoopCalls++;
+        $this->runActiveStates[] = $shell->isRunActive();
+    }
+
+    public function afterRun(Shell $shell, int $exitCode = 0)
+    {
+        $this->afterRunCalls++;
+        $this->exitCodes[] = $exitCode;
+        $this->runActiveStates[] = $shell->isRunActive();
+
+        if ($this->failAfterRun) {
+            throw new \RuntimeException('failed after run');
+        }
+    }
+}
+
+class ThrowingExecutionClosureListener extends ExecutionClosureListener
+{
+    public function onExecute(Shell $shell, string $code)
+    {
+        parent::onExecute($shell, $code);
+
+        throw new \RuntimeException('failed');
+    }
+}
+
+class FailingExecutionCleanupListener extends ExecutionClosureListener
+{
+    public ?\Throwable $failure;
+
+    public function __construct(\Throwable $failure)
+    {
+        $this->failure = $failure;
+    }
+
+    public function afterExecute(Shell $shell)
+    {
+        parent::afterExecute($shell);
+
+        if ($this->failure !== null) {
+            throw $this->failure;
+        }
+    }
+}
+
+class LegacyExecutionClosureListener implements Listener
+{
+    public int $onExecuteCalls = 0;
+
+    public static function isSupported(): bool
+    {
+        return true;
+    }
+
+    public function beforeRun(Shell $shell)
+    {
+    }
+
+    public function beforeLoop(Shell $shell)
+    {
+    }
+
+    public function onInput(Shell $shell, string $input)
+    {
+        return null;
+    }
+
+    public function onExecute(Shell $shell, string $code)
+    {
+        $this->onExecuteCalls++;
+
+        return null;
+    }
+
+    public function afterLoop(Shell $shell)
+    {
+    }
+
+    public function afterRun(Shell $shell, int $exitCode = 0)
+    {
+    }
+}
+
+class ExecutionClosureTestShell extends Shell
+{
+    public bool $failIncludes = false;
+    public bool $failFlushCode = false;
+
+    /** @var Listener[] */
+    private array $listeners;
+
+    /**
+     * @param Listener[] $listeners
+     */
+    public function __construct(Configuration $config, array $listeners)
+    {
+        $this->listeners = $listeners;
+
+        parent::__construct($config);
+    }
+
+    protected function getDefaultLoopListeners(): array
+    {
+        return $this->listeners;
+    }
+
+    public function flushCode()
+    {
+        if ($this->failFlushCode) {
+            $this->failFlushCode = false;
+            throw new \RuntimeException('failed');
+        }
+
+        return parent::flushCode();
+    }
+
+    public function getIncludes(): array
+    {
+        if ($this->failIncludes) {
+            throw new \RuntimeException('failed include');
+        }
+
+        return parent::getIncludes();
+    }
+}

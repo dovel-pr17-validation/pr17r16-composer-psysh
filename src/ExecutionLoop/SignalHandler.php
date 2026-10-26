@@ -1,0 +1,147 @@
+<?php
+
+/*
+ * This file is part of Psy Shell.
+ *
+ * (c) 2012-2026 Justin Hileman
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Psy\ExecutionLoop;
+
+use Psy\Exception\InterruptException;
+use Psy\Shell;
+use Psy\Util\DependencyChecker;
+use Psy\Util\Tty;
+
+/**
+ * A signal handler for interrupting execution with Ctrl-C, used when process forking is disabled.
+ */
+class SignalHandler extends AbstractListener implements ExecutionCleanupListener
+{
+    private bool $sigintHandlerInstalled = false;
+    private bool $restoreStty = false;
+    private bool $wasInterrupted = false;
+    private ?string $originalStty = null;
+    /** @var callable|int|null */
+    private $originalSigintHandler;
+    private ?bool $originalAsyncSignals = null;
+
+    public const PCNTL_FUNCTIONS = [
+        'pcntl_signal',
+        'pcntl_signal_get_handler',
+        'pcntl_async_signals',
+    ];
+
+    public const POSIX_FUNCTIONS = [
+        'posix_isatty',
+    ];
+
+    /**
+     * Signal handler is supported if pcntl and posix extensions are available.
+     */
+    public static function isSupported(): bool
+    {
+        return DependencyChecker::functionsAvailable(self::PCNTL_FUNCTIONS)
+            && DependencyChecker::functionsAvailable(self::POSIX_FUNCTIONS);
+    }
+
+    /**
+     * Save original stty state before the REPL starts.
+     */
+    public function beforeRun(Shell $shell)
+    {
+        if (Tty::supportsStty()) {
+            $this->originalStty = @\shell_exec('stty -g 2>/dev/null');
+        }
+    }
+
+    /**
+     * Install SIGINT handler before executing user code.
+     */
+    public function onExecute(Shell $shell, string $code)
+    {
+        // Nested executions share the signal state owned by their outer execution.
+        // @phan-suppress-next-line PhanAccessMethodInternal -- Internal to PsySH, including this namespace.
+        if (!$shell->claimExecutionResource($this, function () use ($shell): void {
+            $this->afterExecute($shell);
+        })) {
+            return null;
+        }
+
+        $this->wasInterrupted = false;
+        $this->originalSigintHandler = \pcntl_signal_get_handler(\SIGINT);
+        $this->originalAsyncSignals = \pcntl_async_signals();
+
+        // Ensure signal processing is enabled so Ctrl-C can interrupt execution
+        if ($shell->isRunActive() && Tty::supportsStty()) {
+            @\shell_exec('stty isig 2>/dev/null');
+            $this->restoreStty = true;
+        }
+
+        \pcntl_async_signals(true);
+
+        // Install SIGINT handler that throws exception during execution
+        $interrupted = &$this->wasInterrupted;
+        $this->sigintHandlerInstalled = \pcntl_signal(\SIGINT, function () use (&$interrupted) {
+            $interrupted = true;
+            throw new InterruptException('Ctrl+C');
+        });
+
+        return null;
+    }
+
+    /**
+     * Restore signal state after executing user code.
+     *
+     * Restores terminal state and clears stdin if execution was interrupted.
+     */
+    public function afterExecute(Shell $shell)
+    {
+        // Restore the SIGINT handler and async mode from before execution
+        if ($this->sigintHandlerInstalled) {
+            \pcntl_signal(\SIGINT, $this->originalSigintHandler);
+            $this->sigintHandlerInstalled = false;
+        }
+        $this->originalSigintHandler = null;
+
+        if ($this->originalAsyncSignals !== null) {
+            \pcntl_async_signals($this->originalAsyncSignals);
+            $this->originalAsyncSignals = null;
+        }
+
+        // Restore terminal to raw mode after execution
+        // This prevents Ctrl-C at the prompt from generating SIGINT
+        if ($this->restoreStty) {
+            @\shell_exec('stty -isig 2>/dev/null');
+            $this->restoreStty = false;
+        }
+
+        // Clear interrupted prompt input only when the shell owns the run.
+        // Standalone execute() calls leave the caller's stdin untouched.
+        if ($this->wasInterrupted && $shell->isRunActive() && \defined('STDIN') && \is_resource(\STDIN)) {
+            // Check if the stream is still usable
+            $meta = @\stream_get_meta_data(\STDIN);
+            if ($meta && !($meta['eof'] ?? false)) {
+                // Drain any buffered input, suppressing I/O errors
+                @\stream_set_blocking(\STDIN, false);
+                while (@\fgetc(\STDIN) !== false) {
+                }
+                @\stream_set_blocking(\STDIN, true);
+            }
+        }
+        $this->wasInterrupted = false;
+    }
+
+    /**
+     * Restore original terminal state when the REPL exits.
+     */
+    public function afterRun(Shell $shell, int $exitCode = 0)
+    {
+        if ($this->originalStty !== null) {
+            @\shell_exec('stty '.\escapeshellarg(\trim($this->originalStty)).' 2>/dev/null');
+        }
+    }
+}
